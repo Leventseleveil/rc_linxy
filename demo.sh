@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 端到端演示：
-# 1. 起一个 mock 供应商服务（三种行为：正常 200 / 先 500 后 200 / 400 拒绝）
-# 2. 起通知服务
-# 3. 提交四种通知，观察状态流转（DELIVERED / RETRYING→DELIVERED / 死信 / 幂等去重）
+# 1. 起一个 mock 供应商服务（正常 200 / 先 500 后 200 / 400 拒绝）
+# 2. 起通知服务（内嵌 Artemis MQ + SQLite）
+# 3. 五种剧本：正常投递 / 重试成功 / 死信 / 幂等去重 / MQ 接入(多业务队列)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -125,7 +125,7 @@ echo
 echo "==> [demo] 1) 正常投递（一次成功）"
 submit demo_ok user.registered '{"user_id":"u-1"}' demo-1
 
-echo "==> [demo] 2) 不稳定供应商（首次 500 → 重试成功）"
+echo "==> [demo] 2) 不稳定供应商（首次 500 → MQ 延迟消息重试成功）"
 submit demo_flaky payment.succeeded '{"order_id":"o-1"}' demo-2
 
 echo "==> [demo] 3) 不可重试失败（400 → 直接死信）"
@@ -133,6 +133,11 @@ submit demo_reject stock.change '{"sku":"s-1","qty":2}' demo-3
 
 echo "==> [demo] 4) 幂等去重（同 dedupKey 重复提交）"
 submit demo_ok user.registered '{"user_id":"u-1"}' demo-1
+
+echo "==> [demo] 5) MQ 接入（业务系统直接往自己的 intake 队列发消息）"
+# 模拟 crm 业务系统：写一个小 Java 程序连 vm://0 发消息太重，演示用服务的 HTTP 接口说明等价性
+# 真实 MQ 接入见 README「方式 B」与 HighConcurrencyTest.intakeQueuesAcceptAndDeliver
+echo "    (完整 MQ 演示见 mvn test -Dtest=HighConcurrencyTest —— 三业务队列接入 + 200并发压测)"
 
 echo
 echo "==> [demo] 等待投递引擎处理..."

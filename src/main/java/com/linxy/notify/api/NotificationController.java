@@ -1,13 +1,10 @@
 package com.linxy.notify.api;
 
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -15,6 +12,7 @@ import org.springframework.web.bind.annotation.*;
 import com.linxy.notify.domain.Notification;
 import com.linxy.notify.infra.DeliveryAttemptRepository;
 import com.linxy.notify.infra.NotificationRepository;
+import com.linxy.notify.infra.SubmitService;
 import com.linxy.notify.infra.SupplierRegistry;
 import com.linxy.notify.metrics.Metrics;
 
@@ -22,7 +20,8 @@ import jakarta.validation.Valid;
 
 /**
  * 接入 API（对应 peregrine 接入层）：同步 HTTP 收请求、异步投递。
- * 提交即落库返回 202 + notification_id —— 业务方与外部 API 完全解耦。
+ * 提交即落库+入队，返回 202 + notification_id —— 业务方与外部 API 完全解耦。
+ * MQ 接入方式见 README（业务系统也可直接往 notify.intake.<source> 队列发消息）。
  */
 @RestController
 @RequestMapping("/api/v1")
@@ -35,20 +34,23 @@ public class NotificationController {
     private final SupplierRegistry registry;
     private final Metrics metrics;
     private final TokenAuth auth;
+    private final SubmitService submitter;
 
     public NotificationController(NotificationRepository notifications,
                                   DeliveryAttemptRepository attempts,
                                   SupplierRegistry registry,
                                   Metrics metrics,
-                                  TokenAuth auth) {
+                                  TokenAuth auth,
+                                  SubmitService submitter) {
         this.notifications = notifications;
         this.attempts = attempts;
         this.registry = registry;
         this.metrics = metrics;
         this.auth = auth;
+        this.submitter = submitter;
     }
 
-    /** 提交通知请求 */
+    /** 提交通知请求（入口 A：同步 HTTP） */
     @PostMapping("/notifications")
     public ResponseEntity<?> submit(@RequestHeader(value = "Authorization", required = false) String authorization,
                                     @Valid @RequestBody SubmitRequest req) {
@@ -56,46 +58,23 @@ public class NotificationController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(Map.of("error", "invalid or missing bearer token"));
         }
-        if (registry.get(req.supplier()) == null) {
+        SubmitService.SubmitOutcome out = submitter.accept(auth.currentSource(),
+                new SubmitService.IntakeMessage(req.supplier(), req.eventType(), req.payload(), req.dedupKey()));
+
+        if (out.duplicated()) {
+            return ResponseEntity.ok(Map.of(
+                    "notification_id", out.notification().getId(),
+                    "status", out.notification().getStatus().name(),
+                    "deduplicated", true));
+        }
+        if (!out.accepted()) {
             return ResponseEntity.badRequest().body(Map.of(
-                    "error", "unknown supplier",
-                    "available", registry.names()));
+                    "error", out.error(),
+                    "available_suppliers", registry.names()));
         }
-        if (req.payload() == null || req.payload().isBlank()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "payload required (JSON)"));
-        }
-
-        Notification n = new Notification();
-        n.setId(UUID.randomUUID().toString());
-        n.setSource(auth.currentSource());
-        n.setSupplier(req.supplier());
-        n.setEventType(req.eventType());
-        n.setPayload(req.payload());
-        n.setDedupKey(req.dedupKey());
-        n.setStatus(Notification.Status.PENDING);
-        n.setAttempt(0);
-        n.setMaxAttempts(8);
-        n.setNextAttemptAt(Instant.now());
-        n.setCreatedAt(Instant.now());
-        n.setUpdatedAt(Instant.now());
-
-        boolean inserted = notifications.insert(n);
-        metrics.deliveryCounter("accepted");
-        if (!inserted) {
-            // 唯一索引冲突 = 同 source+dedup_key 重复提交 → 幂等返回已有记录
-            Notification existing = notifications.findByDedup(n.getSource(), req.dedupKey()).orElse(null);
-            if (existing != null) {
-                return ResponseEntity.status(HttpStatus.OK).body(Map.of(
-                        "notification_id", existing.getId(),
-                        "status", existing.getStatus().name(),
-                        "deduplicated", true));
-            }
-            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "insert conflict"));
-        }
-
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                "notification_id", n.getId(),
-                "status", n.getStatus().name()));
+                "notification_id", out.notification().getId(),
+                "status", out.notification().getStatus().name()));
     }
 
     /** 查询通知状态（业务方可轮询，或后续扩展 webhook 回调） */
@@ -120,7 +99,7 @@ public class NotificationController {
         return ResponseEntity.ok(attempts.findByNotification(id));
     }
 
-    /** 死信列表 + 单条重发（对应"绝不静默丢弃"的运营兜底） */
+    /** 死信列表 + 单条重发（"绝不静默丢弃"的运营兜底） */
     @GetMapping("/dead-letters")
     public ResponseEntity<?> deadLetters(@RequestHeader(value = "Authorization", required = false) String authorization,
                                          @RequestParam(defaultValue = "20") int limit) {

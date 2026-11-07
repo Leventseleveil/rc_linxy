@@ -19,6 +19,9 @@ public class Metrics {
     private final AtomicLong accepted = new AtomicLong();
     private final AtomicLong supplierMissing = new AtomicLong();
     private final AtomicLong renderFatal = new AtomicLong();
+    private final AtomicLong dispatchPublishFailed = new AtomicLong();
+    private final AtomicLong retryPublishFailed = new AtomicLong();
+    private final AtomicLong sweepRequeued = new AtomicLong();
 
     // p95 简易实现：环形桶记录最近 1024 次耗时
     private final long[] durations = new long[1024];
@@ -34,6 +37,9 @@ public class Metrics {
             case "accepted" -> accepted.incrementAndGet();
             case "supplier_missing" -> supplierMissing.incrementAndGet();
             case "render_fatal" -> renderFatal.incrementAndGet();
+            case "dispatch_publish_failed" -> dispatchPublishFailed.incrementAndGet();
+            case "retry_publish_failed" -> retryPublishFailed.incrementAndGet();
+            case "sweep_requeued" -> sweepRequeued.incrementAndGet();
             default -> {}
         }
     }
@@ -52,15 +58,19 @@ public class Metrics {
     }
 
     public java.util.Map<String, Object> snapshot() {
-        return java.util.Map.of(
-                "accepted", accepted.get(),
-                "delivered", delivered.get(),
-                "retryable", retryable.get(),
-                "non_retryable", nonRetryable.get(),
-                "transport_error", transportError.get(),
-                "exhausted_dead", exhausted.get(),
-                "supplier_missing", supplierMissing.get(),
-                "render_fatal", renderFatal.get(),
-                "delivery_p95_ms", p95DurationMs());
+        java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("accepted", accepted.get());
+        m.put("delivered", delivered.get());
+        m.put("retryable", retryable.get());
+        m.put("non_retryable", nonRetryable.get());
+        m.put("transport_error", transportError.get());
+        m.put("exhausted_dead", exhausted.get());
+        m.put("supplier_missing", supplierMissing.get());
+        m.put("render_fatal", renderFatal.get());
+        m.put("dispatch_publish_failed", dispatchPublishFailed.get());
+        m.put("retry_publish_failed", retryPublishFailed.get());
+        m.put("sweep_requeued", sweepRequeued.get());
+        m.put("delivery_p95_ms", p95DurationMs());
+        return m;
     }
 }

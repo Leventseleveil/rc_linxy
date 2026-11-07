@@ -39,7 +39,8 @@ import com.linxy.notify.supplier.SupplierSpec;
 @TestPropertySource(properties = {
         "spring.datasource.url=jdbc:sqlite:./target/e2e.db",
         "notify.suppliers-dir=./suppliers-e2e",
-        "notify.delivery.poll-interval-ms=300",
+        "notify.delivery.poll-interval-ms=2000",
+        "notify.dispatch.sweep-interval-ms=2000",
         "notify.retry.backoff-seconds=0,0,1",
         "notify.security.api-tokens=test-token"
 })

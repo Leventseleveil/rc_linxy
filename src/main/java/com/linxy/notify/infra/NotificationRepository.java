@@ -121,6 +121,23 @@ public class NotificationRepository {
             id);
     }
 
+    /**
+     * 原子抢占：仅当通知仍处于活跃态且未到投递时间时，把它推后一个"租约窗口"，
+     * 抢到租约的消费者才执行投递 —— 防止 MQ 消费与扫描兜底并发重复投递同一条通知。
+     * 返回 true = 抢到（可以投）；false = 别人正在投或已终态。
+     * 生产多实例下同样适用（条件 UPDATE 是数据库级原子操作）。
+     */
+    public boolean tryLease(String id, int leaseSeconds) {
+        String now = Instant.now().toString();
+        String until = Instant.now().plusSeconds(leaseSeconds).toString();
+        int rows = jdbc.update(
+            "UPDATE notification SET next_attempt_at = ?, updated_at = ? "
+            + "WHERE id = ? AND status IN ('PENDING','RETRYING') "
+            + "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
+            until, now, id, now);
+        return rows == 1;
+    }
+
     /** 投递成功：终态落库（成功这次也算一次 attempt） */
     public int markDelivered(String id, Instant deliveredAt) {
         return jdbc.update(

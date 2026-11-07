@@ -10,17 +10,33 @@ spring:
     driver-class-name: org.sqlite.JDBC
     hikari:
       maximum-pool-size: 8
+  artemis:
+    # 默认内嵌 broker（零外部依赖，clone 即跑）。
+    # 生产连接外部集群：mode=native + broker-url=tcp://mq.internal:61616
+    mode: embedded
+    embedded:
+      enabled: true
+      persistent: false
+  jms:
+    listener:
+      concurrency: 8   # 消费并发：削峰的最后一环（消费速率上限）
 
 notify:
+  # 多业务接入：每个业务系统一个独立 intake 队列（对应参考系统 peregrine 的多 topic 消费）
+  # 业务方二选一：① HTTP POST /api/v1/notifications  ② 往自己的 intake 队列发 JMS 消息
+  intake-queues: ads,crm,inventory
+  # 投递触发队列：落库后立即投 dispatch 队列，消费者驱动投递（秒级）；扫描器仅 30s 兜底
+  dispatch:
+    queue: notify.dispatch
+    # 扫描兜底周期（进程重启丢队列消息时，仍能由扫描捞回 —— DB 是事实源）
+    sweep-interval-ms: 30000
   # 供应商定义文件目录（每个供应商一个 yaml：url 模板 / header 模板 / body 模板 / 重试策略）
   suppliers-dir: ./suppliers
   delivery:
-    # 扫描间隔：多久捞一批"到期待投递"的通知
-    poll-interval-ms: 1000
+    # 兜底扫描间隔（主路径已是 MQ 驱动，见 notify.dispatch）
+    poll-interval-ms: 30000
     # 每轮最多捞取条数（防止积压时打爆外部 API）
     batch-size: 100
-    # 单个供应商并发投递 worker 数
-    workers-per-supplier: 4
     # 请求超时
     connect-timeout-ms: 3000
     read-timeout-ms: 5000
@@ -36,6 +52,9 @@ notify:
 logging:
   level:
     com.linxy.notify: INFO
+    # JDK 23+ 内嵌 Artemis 必需：关闭审计日志基座，避免 Subject.getSubject 兼容性问题
+    #（官方 workaround，见 ARTEMIS-4975；仅影响 audit 日志，不影响消息功能）
+    org.apache.activemq.audit.base: OFF
 
 management:
   endpoints:
