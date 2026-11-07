@@ -6,7 +6,12 @@
 
 以「用户订阅付款成功 → 通知 CRM 更新 Contact 状态」为例，跟着一笔通知走完全程。
 
-**第 1 步：业务系统提交通知 —— 两种递法，任选其一**
+先记住服务的内部分工（对齐参考系统 peregrine 接入层 / mockingbird 发送层的分层）：
+
+- **接入层**：收业务系统的通知（HTTP 或 MQ）→ 校验、幂等落库，立刻给回执
+- **发送层**：从队列捞通知 → 按供应商模板渲染 → 对外发 HTTP → **处理供应商的响应**
+
+**第 1 步【接入层收单】：业务系统提交通知 —— 两种递法，任选其一**
 
 递法 A（主入口）：**HTTP 一发，毫秒级回执**：
 
@@ -39,15 +44,37 @@ jms.send("notify.intake.crm", session -> session.createTextMessage("""
 
 两条递法进入服务后走的是**同一条路**（校验 → 幂等落库 → 发 dispatch 队列），之后的所有流程完全一致。下面以递法 A 拿到的 `notification_id` 为例继续。
 
-**第 2 步：服务内部（业务系统无感知）**
+**第 2 步【接入层内部】：校验、幂等、落库（业务系统无感知）**
 
 ```
-落库(PENDING) → 发 MQ(dispatch队列) → 消费者捞出
-  → 按 crm.yaml 模板渲染出 CRM 要的 Header/Body 格式
-  → HTTP POST 到 CRM（带 X-Notify-Dedup-Key 去重头）
+校验参数 → dedupKey 查唯一索引（重复提交在这里就被拦下）→ 落库 status=PENDING（事实源）
+→ 发一条消息到 dispatch 队列（只是"催一下"发送层，消息丢了也不怕，见第 6 步兜底）
 ```
 
-**第 3 步：查状态（想关心才关心）**
+**第 3 步【发送层干活】：从队列捞出来，按供应商的格式发出去**
+
+发送层消费者从 dispatch 队列拿到这笔通知，做三件事：
+
+```
+① tryLease 抢占（防止队列消息和兜底扫描同时投递同一笔）
+② 按 crm.yaml 模板渲染 —— 把统一的 payload 变成 CRM 要的 Header/Body 格式
+③ HTTP POST 到 CRM（带 X-Notify-Dedup-Key 去重头，防重复送达）
+```
+
+**第 4 步【发送层处理回执】：供应商的每一次响应都被分类处理**
+
+这是本服务的核心 —— 业务系统不关心外部 API 的返回值，**但本服务必须关心**，因为可靠送达全靠对回执的分类处理：
+
+| CRM 的回执 | 分类 | 发送层的动作 |
+|---|---|---|
+| 2xx | ✅ 成功 | 终态 DELIVERED，记录 delivered_at，结束 |
+| 500 / 429 | 🔁 可重试（对方临时不行） | 按退避梯度发**延迟消息**（1s→5s→10s→30s→…），到点自动重投 |
+| 连接失败 / 超时 | 🔁 状态未知（对方可能收到了） | 仍重试（宁可重复不可丢失），靠去重头让 CRM 幂等 |
+| 400 / 401 | ⛔ 不可重试（重试也不会好） | 直接进死信 DEAD，等人工处理 |
+
+每次尝试（无论成败）都写入审计表 —— 能回答"这笔通知到底发了几次、对方每次回了什么"。
+
+**第 5 步：查状态（想关心才关心）**
 
 ```bash
 curl -H "Authorization: Bearer dev-token-1" \
@@ -62,7 +89,9 @@ curl -H "Authorization: Bearer dev-token-1" \
 {"status":"DELIVERED","attempt":1,"delivered_at":"2026-11-07T14:06:36Z", ...}
 ```
 
-**那如果 CRM 挂了呢？** 看服务日志里的真实流转（`./demo.sh` 可完整复现）：
+### 场景 ①：CRM 临时挂了（500）→ 自动重试到成功
+
+看服务日志里的真实流转（`./demo.sh` 可完整复现）：
 
 ```
 # CRM 返回 500 → 分类为"可重试" → 按退避梯度 1s 后 MQ 延迟消息重试
@@ -71,7 +100,9 @@ retry scheduled id=857b1df5... attempt=1 next_in=1s reason=vendor server error
 delivered id=857b1df5... supplier=crm status=200 attempt=2
 ```
 
-**如果 CRM 明确拒绝（400 参数错误）？** 重试也不会好，直接进死信等人工处理：
+### 场景 ②：CRM 明确拒绝（400 参数错误）→ 直接死信，人工兜底
+
+重试也不会好，不浪费重试预算，直接进死信等人工处理：
 
 ```
 dead (non-retryable) id=ef17636f... supplier=crm status=400
@@ -79,12 +110,18 @@ dead (non-retryable) id=ef17636f... supplier=crm status=400
 POST /api/v1/dead-letters/ef17636f.../redeliver  → {"status":"PENDING"}
 ```
 
-**如果业务系统重复提交同一笔？** 幂等键兜底，两次提交拿到同一个 ID：
+### 场景 ③：业务系统重复提交同一笔 → 幂等键兜底
 
-```json
+两次提交拿到同一个 ID，只投递一次：
+
+```
 第 1 次 → 202 {"notification_id":"bce4e0c9...","status":"PENDING"}
 第 2 次 → 200 {"notification_id":"bce4e0c9...","deduplicated":true}   # 不重复投递
 ```
+
+### 场景 ④：队列消息丢了 → 扫描兜底捞回
+
+第 2 步说过 dispatch 消息只是"催一下"：**DB 才是事实源**。每 30s 的兜底扫描把"到期待投递但没送达"的通知重新入队 —— 进程重启、MQ 抖动都不丢通知（由第 3 步的 tryLease 保证不重复投）。
 
 一句话总结：**通知要么送达、要么在死信里等你 —— 绝不静默丢弃，绝不阻塞业务。**
 
