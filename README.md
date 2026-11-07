@@ -4,9 +4,11 @@
 
 ## 一、通俗流程演示：一笔通知的一生
 
-以「用户订阅付款成功 → 通知 CRM 更新 Contact 状态」为例，跟着一笔通知走完全程：
+以「用户订阅付款成功 → 通知 CRM 更新 Contact 状态」为例，跟着一笔通知走完全程。
 
-**第 1 步：业务系统提交通知（收到回执只要几毫秒）**
+**第 1 步：业务系统提交通知 —— 两种递法，任选其一**
+
+递法 A（主入口）：**HTTP 一发，毫秒级回执**：
 
 ```bash
 curl -X POST localhost:8080/api/v1/notifications \
@@ -25,6 +27,18 @@ curl -X POST localhost:8080/api/v1/notifications \
 {"notification_id":"bce4e0c9-78cf-...","status":"PENDING"}   # HTTP 202
 ```
 
+递法 B（可选入口）：**业务系统直接往自己的 MQ 队列丢一条消息**（适合已 MQ 化的业务，消息体字段与 HTTP 完全相同）：
+
+```java
+// 业务系统代码：往 notify.intake.crm 发一条消息就完事，队列名即业务身份
+jms.send("notify.intake.crm", session -> session.createTextMessage("""
+    {"supplier": "crm", "eventType": "payment.succeeded",
+     "payload": "{\"contact_id\":\"c-9527\"}", "dedupKey": "order-2026-000042"}
+    """));
+```
+
+两条递法进入服务后走的是**同一条路**（校验 → 幂等落库 → 发 dispatch 队列），之后的所有流程完全一致。下面以递法 A 拿到的 `notification_id` 为例继续。
+
 **第 2 步：服务内部（业务系统无感知）**
 
 ```
@@ -39,6 +53,8 @@ curl -X POST localhost:8080/api/v1/notifications \
 curl -H "Authorization: Bearer dev-token-1" \
   localhost:8080/api/v1/notifications/bce4e0c9-78cf-...
 ```
+
+（递法 B 没有 notification_id 回执，用提交时自己传的 dedupKey 反查同一接口即可）
 
 顺利时看到（几秒内）：
 
@@ -145,7 +161,8 @@ jms.send("notify.intake.crm", session -> session.createTextMessage("""
 ### 运维接口
 
 ```bash
-GET  /api/v1/notifications/{id}           # 状态查询
+GET  /api/v1/notifications/{id}           # 状态查询（HTTP 接入方用 ID）
+GET  /api/v1/notifications?dedupKey=xxx   # 状态查询（MQ 接入方用 dedupKey 反查）
 GET  /api/v1/notifications/{id}/attempts  # 投递轨迹（每次出站的URL/状态码/耗时）
 GET  /api/v1/dead-letters                 # 死信列表
 POST /api/v1/dead-letters/{id}/redeliver  # 死信重发

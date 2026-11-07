@@ -89,6 +89,21 @@ public class NotificationController {
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "not found")));
     }
 
+    /**
+     * 按 dedupKey 反查（MQ 接入方的查询途径：发消息没有 notification_id 回执，
+     * 用提交时自己传的 dedupKey 查询同一笔通知）。
+     */
+    @GetMapping("/notifications")
+    public ResponseEntity<?> getByDedupKey(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                           @RequestParam String dedupKey) {
+        if (!auth.check(authorization)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "unauthorized"));
+        }
+        return notifications.findByDedup(auth.currentSource(), dedupKey)
+                .<ResponseEntity<?>>map(n -> ResponseEntity.ok(toView(n)))
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "not found")));
+    }
+
     /** 投递轨迹：这条通知的每次出站尝试 */
     @GetMapping("/notifications/{id}/attempts")
     public ResponseEntity<?> attempts(@RequestHeader(value = "Authorization", required = false) String authorization,

@@ -260,6 +260,28 @@ class EndToEndTest {
         assertThat(n.getAttempt()).isZero();
     }
 
+    @Test
+    @Order(9)
+    void queryByDedupKeyWorks() {
+        // MQ 接入方没有 notification_id 回执，dedupKey 反查是其唯一查询途径
+        String dedup = "e2e-q-" + UUID.randomUUID();
+        var body = Map.of("supplier", "e2e_ok", "eventType", "user.registered",
+                "payload", "{\"user_id\":\"u-77\"}", "dedupKey", dedup);
+        var resp = rest.postForEntity("/api/v1/notifications", request(body), Map.class);
+        String id = (String) resp.getBody().get("notification_id");
+
+        var byKey = rest.exchange("/api/v1/notifications?dedupKey=" + dedup,
+                org.springframework.http.HttpMethod.GET,
+                new org.springframework.http.HttpEntity<>(withAuth()), Map.class);
+        assertThat(byKey.getStatusCode().value()).isEqualTo(200);
+        assertThat(byKey.getBody()).containsEntry("notification_id", id);
+
+        var notFound = rest.exchange("/api/v1/notifications?dedupKey=no-such-key",
+                org.springframework.http.HttpMethod.GET,
+                new org.springframework.http.HttpEntity<>(withAuth()), Map.class);
+        assertThat(notFound.getStatusCode().value()).isEqualTo(404);
+    }
+
     // ---------- helpers ----------
 
     private <T extends Map<String, ?>> org.springframework.http.HttpEntity<T> request(T body) {
