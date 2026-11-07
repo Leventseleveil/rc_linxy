@@ -12,3 +12,4 @@ suppliers-e2e/
 *.db
 *.db-wal
 *.db-shm
+suppliers-load/
