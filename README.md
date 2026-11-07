@@ -74,30 +74,30 @@ POST /api/v1/dead-letters/ef17636f.../redeliver  → {"status":"PENDING"}
 
 ## 二、整体架构
 
+**业务系统怎么把通知递进来（两条入口，主次分明）：**
+
 ```
-业务系统A ──┐ HTTP POST
-业务系统B ──┤            ┌──────────────────────────────────────┐
-业务系统C ──┘            │              notify-service           │
-     │                   │                                      │
-     │ 各自的 MQ          │  接入层 IntakeListener（队列=业务身份） │
-     └──▶ notify.intake.ads / .crm / .inventory ──▶ SubmitService│
-                         │      ① 校验+幂等 → 落库PENDING(事实源)  │
-                         │      ② 发 dispatch MQ（秒级触发）       │
-                         │              │                        │
-                         │   30s 扫描兜底（MQ丢消息时捞回）◀──┐     │
-                         │              ▼                    │     │
-                         │  投递引擎（MQ消费者×8 并发）         │     │
-                         │   ├─ 每供应商令牌桶限速              │     │
-                         │   ├─ YAML模板渲染(Header/Body)      │     │
-                         │   ├─ HTTP投递 + 去重头              │     │
-                         │   └─ 2xx→DELIVERED                 │     │
-                         │       5xx/429/超时→延迟MQ重试 ───────┼─────┘
-                         │       4xx→DEAD(死信,可人工重发)      │
-                         │   每次尝试写审计表                   │
-                         └──────────────────────────────────────┘
-                                        │
-                                        ▼
-                            外部供应商 API（每家一个 YAML）
+业务系统 ──① HTTP POST /api/v1/notifications（主入口，同步 202 回执）──┐
+          ──② JMS → notify.intake.<业务名>（可选，队列=业务身份）──────┤
+                                                                        ▼
+                                              SubmitService（统一接入）
+                                               ① 校验+幂等 → 落库 PENDING（事实源）
+                                               ② 发 dispatch MQ（秒级触发）
+                                                        │
+                          30s 扫描兜底（MQ丢消息时捞回）◀─┤
+                                                        ▼
+                                   投递引擎（MQ 消费者×8 并发）
+                                    ├─ tryLease 抢占（防重复投递）
+                                    ├─ 每供应商令牌桶限速
+                                    ├─ YAML 模板渲染(Header/Body)
+                                    ├─ HTTP 投递 + 去重头
+                                    └─ 2xx → DELIVERED
+                                        5xx/429/超时 → 延迟 MQ 重试（1s→5s→…→900s）
+                                        4xx → DEAD（死信，可人工重发）
+                                    每次尝试写审计表
+                                                        │
+                                                        ▼
+                                            外部供应商 API（每家一个 YAML）
 ```
 
 ## 三、快速开始
@@ -116,21 +116,31 @@ mvn package -DskipTests && java -jar target/notify-service-1.0.0.jar
 mvn test
 ```
 
-### 两种接入方式
+### 业务系统怎么接入？（两种入口，主次分明）
 
-**方式 A：同步 HTTP**（见第 1 步示例）
+**方式 A：HTTP POST（主入口，标准接入方式）** —— 见第 1 步示例。任何业务系统一个 `curl` 就能接，立刻拿回 `202 + notification_id`。题目是"API 通知服务"，这是默认方式。
 
-**方式 B：MQ 投递**（业务系统已有 MQ 链路时，直接往自己的 intake 队列发）：
+**方式 B：MQ 投递（可选入口，给已有 MQ 基础设施的业务方）** —— 业务系统直接往**自己的 intake 队列**发 JMS 消息，消息体就是通知内容：
 
 ```java
-// 业务系统代码：往 notify.intake.crm 发 JMS TextMessage，body 是 JSON
+// 业务系统代码：往 notify.intake.crm 发 TextMessage，body 是 JSON（字段同 HTTP 接口）
 jms.send("notify.intake.crm", session -> session.createTextMessage("""
     {"supplier": "crm", "eventType": "payment.succeeded",
      "payload": "{\"contact_id\":\"c-9527\"}", "dedupKey": "order-42"}
     """));
 ```
 
-关键设计：**队列名即业务身份**（source 归属由队列决定，不信任消息体）——防伪造，也让多业务天然隔离：某业务消息堆积不影响其他业务。
+| | 方式 A：HTTP | 方式 B：MQ |
+|---|---|---|
+| 适用 | 绝大多数业务（默认） | 已有 MQ 链路 / 超高频上报 |
+| 回执 | ✅ 同步 202 + notification_id | ❌ 无回执，靠 dedupKey 查询/幂等 |
+| 业务身份 | Bearer token 映射 | **队列名即身份**（不信任消息体，防伪造） |
+| 削峰 | 服务端 dispatch 队列缓冲 | intake 队列天然缓冲，堆积互不干扰 |
+| 背压 | 客户端需处理限流响应 | broker 天然背压 |
+
+两条入口汇聚到**同一个 `SubmitService.accept()`**（校验 → 幂等落库 → 发 dispatch 队列），之后的投递、重试、审计、死信路径完全一致 —— 对业务方来说，只是"怎么把通知递进来"的区别。
+
+对应参考系统的结构：**业务系统 →（HTTP/MQ）→ peregrine 接入层 → MQ → mockingbird 发送层**，本服务的 IntakeListener + SubmitService = 接入层，DispatchConsumer + DeliveryEngine = 发送层。
 
 ### 运维接口
 
