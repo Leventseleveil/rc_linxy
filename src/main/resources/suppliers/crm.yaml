@@ -1,0 +1,30 @@
+# 供应商定义示例：CRM 系统（订阅付款成功 → 更新 Contact 状态）
+# 每个供应商一个文件，放 suppliers-dir 下。字段均可使用 {{var}} 模板变量（来自业务 payload）。
+name: crm
+description: CRM Contact 状态同步
+request:
+  method: POST
+  url: https://crm.example.com/api/v1/contacts/status
+  headers:
+    Content-Type: application/json
+    Authorization: "Bearer {{secret.crm_token}}"
+    X-Event-Type: "{{event_type}}"
+  body: |
+    {
+      "contactId": "{{payload.contact_id}}",
+      "status": "{{payload.status}}",
+      "paidAt": "{{payload.paid_at}}"
+    }
+response:
+  # HTTP 200/2xx 视为成功；vendor 业务码解析（可选）
+  success_when: "2xx"
+retry:
+  # 覆盖全局退避序列（可选，不配则用全局）
+  backoff_seconds: [1, 5, 10, 30, 60]
+rate_limit:
+  # 令牌桶：防止打爆对方（对齐 mockingbird BucketQuotaService 思想）
+  qps: 50
+  burst: 100
+timeout:
+  connect_ms: 3000
+  read_ms: 5000

@@ -1,0 +1,22 @@
+# 供应商定义示例：广告系统（注册成功归因回传）
+name: ads
+description: 广告平台转化回传
+request:
+  method: POST
+  url: https://ads.example.com/track/register
+  headers:
+    Content-Type: application/json
+    X-Api-Key: "{{secret.ads_api_key}}"
+  body: |
+    {
+      "clickId": "{{payload.click_id}}",
+      "userId": "{{payload.user_id}}",
+      "eventTime": "{{payload.registered_at}}"
+    }
+response:
+  success_when: "2xx"
+retry:
+  backoff_seconds: [1, 5, 10, 30]
+rate_limit:
+  qps: 100
+  burst: 200

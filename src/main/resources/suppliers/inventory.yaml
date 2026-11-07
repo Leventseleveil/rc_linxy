@@ -1,0 +1,22 @@
+# 供应商定义示例：库存系统（购买商品 → 库存变更）
+name: inventory
+description: 库存系统变更通知
+request:
+  method: POST
+  url: https://inventory.example.com/internal/stock/change
+  headers:
+    Content-Type: application/json
+    Authorization: "Basic {{secret.inv_basic}}"
+  body: |
+    {
+      "sku": "{{payload.sku}}",
+      "orderId": "{{payload.order_id}}",
+      "delta": {{payload.quantity}}
+    }
+response:
+  success_when: "2xx"
+retry:
+  backoff_seconds: [1, 5, 10, 30, 60, 300]
+rate_limit:
+  qps: 20
+  burst: 40
